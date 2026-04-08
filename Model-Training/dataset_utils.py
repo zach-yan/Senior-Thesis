@@ -1,0 +1,234 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.signal import find_peaks
+from sklearn.model_selection import train_test_split
+import random
+import pyepo
+
+
+
+def mode(probs): return np.argmax(probs) + 1
+
+
+def predictive_entropy(probs, eps=1e-8):
+    probs = np.clip(probs, eps, 1.0)
+    return -np.sum(probs * np.log(probs))
+
+
+def kl_divergence(p, q, eps=1e-8):
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    return np.sum(p * np.log(p / q))
+
+
+def addFeatures(trueState, time, patientProbs, prevPatientProbs, last_observed_state, time_since_last_scan):
+    mHat = mode(patientProbs)
+    mHatLast = mode(prevPatientProbs)
+    uncert = predictive_entropy(patientProbs)
+    prevUncert = predictive_entropy(prevPatientProbs)
+    diverge = kl_divergence(patientProbs, prevPatientProbs)
+
+    output = np.zeros(23, dtype='float')
+    output[0] = trueState if not np.isnan(trueState) else 0.0
+    output[1] = mHat
+    output[2] = mHatLast
+    output[3] = mHat - mHatLast
+    output[4] = uncert
+    output[5] = prevUncert
+    output[6] = uncert - prevUncert
+    output[7] = diverge
+    output[8] = time
+    for i in range(4):
+        output[i + 9] = patientProbs[i]
+        output[i + 13] = prevPatientProbs[i]
+        output[i + 17] = patientProbs[i] - prevPatientProbs[i]
+
+    output[21] = last_observed_state if not np.isnan(last_observed_state) else 0.0
+    output[22] = time_since_last_scan
+    return output
+
+def sample_independent_windows(patients, act_map, triv_map, batch_size, actionable_ratio=0.5):
+    n_act = int(batch_size * actionable_ratio)
+    n_triv = batch_size - n_act
+
+    act_indices = [act_map[i] for i in np.random.choice(len(act_map), n_act)]
+    triv_indices = [triv_map[i] for i in np.random.choice(len(triv_map), n_triv)]
+    combined = act_indices + triv_indices
+    np.random.shuffle(combined)
+
+    contexts, targets = [], []
+    for p_idx, t in combined:
+        p = patients[p_idx]
+        contexts.append(p.get_context(t))
+        targets.append(p.get_targets(t))  # NEW: Retrieves combined array of length 4
+
+    return torch.tensor(np.array(contexts), dtype=torch.float32), \
+        torch.tensor(np.array(targets), dtype=torch.float32)
+
+def sample_natural_independent_windows(patients, batch_size):
+    all_x, all_s = [], []
+    patient_indices = np.random.choice(len(patients), batch_size, replace=True)
+
+    for p_idx in patient_indices:
+        p = patients[p_idx]
+        t = np.random.randint(0, p.T - 2)
+        all_x.append(p.get_context(t))
+        all_s.append(p.get_targets(t))  # NEW: Changed from get_rewards to get_targets
+
+    return torch.tensor(np.array(all_x), dtype=torch.float32), \
+        torch.tensor(np.array(all_s), dtype=torch.float32)
+
+def get_peak_indices_tuned(rewards, threshold=0.028):
+    T = len(rewards)
+    if T == 0: return []
+    peaks, _ = find_peaks(rewards, height=threshold, prominence=1e-5)
+    candidates = set(peaks)
+    glob_max_idx = np.argmax(rewards)
+    if rewards[glob_max_idx] >= threshold: candidates.add(glob_max_idx)
+    if T > 0 and rewards[0] >= threshold:
+        if T == 1 or rewards[0] >= rewards[1]: candidates.add(0)
+    if T > 1 and rewards[-1] >= threshold:
+        if rewards[-1] >= rewards[-2]: candidates.add(T - 1)
+    return sorted(list(candidates))
+
+
+class Patient:
+    def __init__(self, patient_id, patient_rewards, delay_values, features, patient_scans, T):
+        self.id = patient_id
+        self.features = features
+        self.T = T
+        self.rewards = patient_rewards
+        self.delay_values = delay_values
+        self.scans = patient_scans  # Array of 1s (scan) and 0s (no scan)
+
+    def get_context(self, t, window=2):
+        indices = np.arange(t - window + 1, t + 1)
+        indices = np.maximum(indices, 0)
+        return self.features[indices, :].flatten()
+
+    def get_targets(self, t):
+        if t + 3 > self.T:
+            padding = np.zeros(3 - (self.T - t))
+            rewards_window = np.concatenate([self.rewards[t:], padding])
+        else:
+            rewards_window = self.rewards[t:t + 3]
+
+        delay_val = np.array([self.delay_values[t]])
+        return np.concatenate([rewards_window, delay_val])
+
+    def get_clinician_action(self, t, horizon=3):
+        """
+        Determines the actual action taken by the clinician within the decision window.
+        Maps the binary scan array to the 4-class action space:
+        0: Scan at t
+        1: Scan at t+1
+        2: Scan at t+2
+        3: Defer (No scan in the window)
+        """
+        # Ensure we don't look past the patient's actual length of stay
+        max_lookahead = min(horizon, self.T - t)
+
+        for i in range(max_lookahead):
+            if self.scans[t + i] == 1:
+                return i  # Return the index of the first scan found in the window
+
+        # If no scan was found in the 3-hour window, the clinician deferred
+        return 3
+
+
+def create_patient_objects(df, horizon_T=3):
+    patient_objects = []
+    for pid, group in df.groupby('ptid_idx'):
+        group = group.sort_values('hour').reset_index(drop=True)
+        scan_indices = group.index[group['true_scans'] == 1].tolist()
+        if not scan_indices: continue
+
+        first_scan_idx = scan_indices[0]
+        remaining_stay_df = group.iloc[first_scan_idx:].reset_index(drop=True)
+        total_stay = len(remaining_stay_df)
+
+        if total_stay >= horizon_T:
+            initial_state = remaining_stay_df['last_known_mls_class'].iloc[0]
+            probs_matrix = remaining_stay_df[['proba_0', 'proba_1', 'proba_2', 'proba_3']].values
+            rewards = remaining_stay_df['proxy_reward'].values
+            delay_values = remaining_stay_df['scan_delay_value'].values
+            scans = remaining_stay_df['true_scans'].values
+            hours = remaining_stay_df['hour'].values
+
+            feature_list = []
+            last_scan_hour = hours[0]
+            last_observed_state = initial_state
+
+            for t in range(total_stay):
+                if scans[t] == 1:
+                    last_scan_hour = hours[t]
+                    last_observed_state = remaining_stay_df['last_known_mls_class'].iloc[t]
+
+                time_since_last_scan = hours[t] - last_scan_hour
+                current_probs = probs_matrix[t]
+                prev_probs = probs_matrix[t - 1] if t > 0 else (np.ones(4) / 4.0)
+
+                feat_vec = addFeatures(initial_state, hours[t], current_probs, prev_probs,
+                                       last_observed_state, time_since_last_scan)
+                feature_list.append(feat_vec)
+
+            p = Patient(patient_id=pid, patient_rewards=rewards, delay_values=delay_values,
+                        features=np.array(feature_list), patient_scans=scans, T=total_stay)
+            patient_objects.append(p)
+    return patient_objects
+
+
+def generate_maps(patients, target_w=0.028):
+    act_map, triv_map = [], []
+    for p_idx, p in enumerate(patients):
+        true_peak_indices = set(get_peak_indices_tuned(p.rewards, threshold=target_w))
+        for t in range(p.T - 2):
+            if not {t, t + 1, t + 2}.isdisjoint(true_peak_indices):
+                act_map.append((p_idx, t))
+            else:
+                triv_map.append((p_idx, t))
+    return act_map, triv_map
+
+def sample_hospital_shifts_pyepo(patients, act_map, triv_map, batch_size, n_patients, actionable_ratio=0.5):
+    all_x, all_s = [], []
+    for _ in range(batch_size):
+        n_act = int(n_patients * actionable_ratio)
+        n_triv = n_patients - n_act
+
+        act_idx = [act_map[i] for i in np.random.choice(len(act_map), n_act, replace=True)]
+        triv_idx = [triv_map[i] for i in np.random.choice(len(triv_map), n_triv, replace=True)]
+        shift_participants = act_idx + triv_idx
+        np.random.shuffle(shift_participants)
+
+        inst_x, inst_s = [], []
+        for p_idx, t in shift_participants:
+            p = patients[p_idx]
+            inst_x.append(p.get_context(t))
+            inst_s.extend(p.get_targets(t))  # Gets T + 1 targets
+
+        all_x.extend(inst_x)
+        all_s.append(inst_s)
+    return torch.tensor(np.array(all_x), dtype=torch.float32), torch.tensor(np.array(all_s), dtype=torch.float32)
+
+
+def sample_natural_hospital_shifts_pyepo(patients, batch_size, n_patients):
+    all_x, all_s = [], []
+    for _ in range(batch_size):
+        shift_participants = np.random.choice(len(patients), n_patients, replace=True)
+        inst_x, inst_s = [], []
+        for p_idx in shift_participants:
+            p = patients[p_idx]
+            t = np.random.randint(0, p.T - 2)
+            inst_x.append(p.get_context(t))
+            inst_s.extend(p.get_targets(t))
+
+        all_x.extend(inst_x)
+        all_s.append(inst_s)
+
+    return torch.tensor(np.array(all_x), dtype=torch.float32), torch.tensor(np.array(all_s), dtype=torch.float32)
