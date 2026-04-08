@@ -1,0 +1,87 @@
+import json
+import pulp
+
+
+def solve_dynamic_global_oracle(patient_trace, cap_func, SIM_HOURS=1000, Q=6, delta=3, kappa=0.028):
+    """
+    Solves the Global Static Problem with dynamic capacity constraints.
+    cap_func is a function that returns the number of available scanners at hour t.
+    """
+    m = pulp.LpProblem("Global_Static_Oracle_Dynamic", pulp.LpMaximize)
+    x = {}
+    active_patients_at_time = {t: [] for t in range(SIM_HOURS)}
+    objective_terms = []
+
+    for episode_id, p_data in enumerate(patient_trace):
+        t_arrive = p_data['arrival_hour']
+        los = p_data['length_of_stay']
+        rewards = p_data['true_rewards']
+
+        # 1. Identify peaks (P_i) and apply the +/- 1 hour grace period
+        valid_scan_times = set()
+
+        for local_t in range(los):
+            is_local_max = True
+            # Check Equation 3.1 & 3.2 conditions (S_{i,t} >= S_{i,t-1} and S_{i,t} >= S_{i,t+1})
+            if local_t > 0 and rewards[local_t] < rewards[local_t - 1]:
+                is_local_max = False
+            if local_t < los - 1 and rewards[local_t] < rewards[local_t + 1]:
+                is_local_max = False
+
+            if is_local_max:
+                # Add the peak and the +/- 1 grace period bounds, ensuring we stay within [0, los-1]
+                valid_scan_times.update([max(0, local_t - 1), local_t, min(los - 1, local_t + 1)])
+
+        # 2. Build variables and apply Equation 3.3e
+        for local_t in range(los):
+            global_t = t_arrive + local_t
+            if global_t >= SIM_HOURS: continue
+
+            x[episode_id, global_t] = pulp.LpVariable(f"x_ep{episode_id}_t{global_t}", cat=pulp.LpBinary)
+
+            # Enforce relaxed Equation 3.3e: x_{i,t} = 0 if not in the grace-period expanded P_i
+            if local_t not in valid_scan_times:
+                m += x[episode_id, global_t] == 0, f"peak_align_ep{episode_id}_t{global_t}"
+
+            immediate_reward = rewards[local_t] - kappa
+            objective_terms.append(immediate_reward * x[episode_id, global_t])
+            active_patients_at_time[global_t].append(episode_id)
+
+    m += pulp.lpSum(objective_terms), "Total_Proxy_Reward"
+
+    # Dynamic Capacity Constraint R(t) - Equation 3.3b
+    for t in range(SIM_HOURS):
+        if active_patients_at_time[t]:
+            m += pulp.lpSum(x[ep, t] for ep in active_patients_at_time[t]) <= cap_func(t), f"capacity_t{t}"
+
+    for episode_id, p_data in enumerate(patient_trace):
+        t_arrive = p_data['arrival_hour']
+        los = p_data['length_of_stay']
+
+        # Max Scans Constraint (Q) - Equation 3.3c
+        m += pulp.lpSum(x[episode_id, t_arrive + local_t] for local_t in range(los) if
+                        t_arrive + local_t < SIM_HOURS) <= Q, f"max_scans_ep{episode_id}"
+
+        # Refractory Period Constraint (Delta) - Equation 3.3d
+        for local_t in range(los - delta + 1):
+            global_t = t_arrive + local_t
+            if global_t >= SIM_HOURS: continue
+            m += pulp.lpSum(x[episode_id, global_t + d] for d in range(delta) if
+                            global_t + d < SIM_HOURS) <= 1, f"refractory_ep{episode_id}_t{global_t}"
+
+    # Use HiGHS solver and silence the output so it doesn't clutter your simulation logs
+    solver = pulp.HiGHS_CMD(msg=False)
+    m.solve(solver)
+
+    optimal_scan_log = []
+    if m.status == pulp.LpStatusOptimal:
+        for (episode_id, global_t), var in x.items():
+            if pulp.value(var) and pulp.value(var) > 0.5:
+                optimal_scan_log.append({
+                    'patient_id': patient_trace[episode_id].get('patient_id', episode_id),
+                    'hour': global_t
+                })
+    else:
+        print(f"Warning: Global Optimization failed with status: {pulp.LpStatus[m.status]}")
+
+    return optimal_scan_log
